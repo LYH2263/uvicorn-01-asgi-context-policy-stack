@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import logging
-import sys
 from collections.abc import Callable, Generator
 from typing import Any, ClassVar, Literal
 from urllib.parse import unquote
@@ -21,6 +20,7 @@ from uvicorn._types import (
     HTTPScope,
 )
 from uvicorn.config import Config
+from uvicorn.context import LoggingBinding, create_asgi_task, current_logging_binding, effective_policy
 from uvicorn.logging import TRACE_LOG_LEVEL
 from uvicorn.protocols.http.flow_control import HIGH_WATER_LIMIT, FlowControl, service_unavailable
 from uvicorn.protocols.utils import get_client_addr, get_local_addr, get_path_with_query_string, get_remote_addr, is_ssl
@@ -229,6 +229,9 @@ class ZttpH2Protocol(asyncio.Protocol):
         else:
             app = self.app
 
+        # Read the merged view per stream: concurrent streams sharing this
+        # protocol object must each act on their own current stack top.
+        policy = effective_policy(self.config)
         cycle = RequestResponseCycle(
             scope=scope,
             conn=self.conn,
@@ -242,16 +245,12 @@ class ZttpH2Protocol(asyncio.Protocol):
             message_event=asyncio.Event(),
             on_response=self.on_response_complete,
             resume_reading=self.resume_reading_if_idle,
+            protocol_context=contextvars.copy_context(),
+            creator_logging_binding=policy.logging_binding,
         )
         self.cycles[event.stream_id] = cycle
 
-        if self.config.reset_contextvars:
-            if sys.version_info >= (3, 11):  # pragma: py-lt-311
-                task = self.loop.create_task(cycle.run_asgi(app), context=contextvars.Context())
-            else:  # pragma: py-gte-311
-                task = contextvars.Context().run(self.loop.create_task, cycle.run_asgi(app))
-        else:
-            task = self.loop.create_task(cycle.run_asgi(app))
+        task = create_asgi_task(self.loop, cycle.run_asgi(app), policy.task_context)
         task.add_done_callback(self.tasks.discard)
         self.tasks.add(task)
 
@@ -350,6 +349,8 @@ class RequestResponseCycle:
         message_event: asyncio.Event,
         on_response: Callable[[int], None],
         resume_reading: Callable[[], None],
+        protocol_context: contextvars.Context,
+        creator_logging_binding: LoggingBinding,
     ) -> None:
         self.scope = scope
         self.conn = conn
@@ -363,6 +364,10 @@ class RequestResponseCycle:
         self.message_event = message_event
         self.on_response = on_response
         self.resume_reading = resume_reading
+        # Snapshot of the context visible to the protocol layer when the
+        # stream cycle starts, used when logging_binding is "protocol".
+        self.protocol_context = protocol_context
+        self.creator_logging_binding = creator_logging_binding
 
         # Connection state
         self.disconnected = False
@@ -379,6 +384,26 @@ class RequestResponseCycle:
         self.trailers: list[tuple[bytes, bytes]] = []
         self.bodyless = False
         self.expected_content_length: int | None = None
+
+    def _log_access(self, status: int) -> None:
+        """Emit the access record on the ASGI-task or protocol-layer context.
+
+        A frame pushed inside the ASGI stream task wins; otherwise the
+        binding captured at stream cycle creation applies.
+        """
+        binding = current_logging_binding() or self.creator_logging_binding
+        arguments = (
+            '%s - "%s %s HTTP/%s" %d',
+            get_client_addr(self.scope),
+            self.scope["method"],
+            get_path_with_query_string(self.scope),
+            self.scope["http_version"],
+            status,
+        )
+        if binding == "protocol":
+            self.protocol_context.run(self.access_logger.info, *arguments)
+        else:
+            self.access_logger.info(*arguments)
 
     # ASGI exception wrapper
     async def run_asgi(self, app: ASGI3Application) -> None:
@@ -474,14 +499,7 @@ class RequestResponseCycle:
                 self.expected_content_length = None
 
             if self.access_log:
-                self.access_logger.info(
-                    '%s - "%s %s HTTP/%s" %d',
-                    get_client_addr(self.scope),
-                    self.scope["method"],
-                    get_path_with_query_string(self.scope),
-                    self.scope["http_version"],
-                    status,
-                )
+                self._log_access(status)
 
             # Write response headers
             self.stream.send_response(status, headers)

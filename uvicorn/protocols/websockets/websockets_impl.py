@@ -27,6 +27,7 @@ from uvicorn._types import (
     WebSocketScope,
 )
 from uvicorn.config import Config, UvicornDeprecationWarning
+from uvicorn.context import create_asgi_task, effective_policy
 from uvicorn.logging import TRACE_LOG_LEVEL
 from uvicorn.protocols.utils import (
     ClientDisconnected,
@@ -210,7 +211,10 @@ class WebSocketProtocol(WebSocketServerProtocol):
             "state": self.app_state.copy(),
             "extensions": {"websocket.http.response": {}},
         }
-        task = self.loop.create_task(self.run_asgi())
+        # Merge Config.reset_contextvars with the stack top visible when the
+        # handshake completes (never a snapshot from protocol construction).
+        task_context = effective_policy(self.config).task_context
+        task = create_asgi_task(self.loop, self.run_asgi(), task_context)
         task.add_done_callback(self.on_task_complete)
         self.tasks.add(task)
         await self.handshake_started_event.wait()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextvars
 import io
 import sys
 import warnings
@@ -22,6 +23,7 @@ from uvicorn._types import (
     StartResponse,
     WSGIApp,
 )
+from uvicorn.context import effective_policy
 
 
 def build_environ(scope: HTTPScope, message: ASGIReceiveEvent, body: io.BytesIO) -> Environ:
@@ -132,7 +134,19 @@ class WSGIResponder:
             body.seek(0)
         environ = build_environ(self.scope, message, body)
         self.loop = asyncio.get_event_loop()
-        wsgi = self.loop.run_in_executor(self.executor, self.wsgi, environ, self.start_response)
+        # wsgi_thread only forks the executor worker; the sender task stays a
+        # plain ASGI task and must not inherit this rule.
+        if effective_policy().wsgi_thread == "copy":
+            worker_context = contextvars.copy_context()
+        else:
+            worker_context = contextvars.Context()
+        wsgi = self.loop.run_in_executor(
+            self.executor,
+            worker_context.run,
+            self.wsgi,
+            environ,
+            self.start_response,
+        )
         sender = self.loop.create_task(self.sender(send))
         try:
             await asyncio.wait_for(wsgi, None)

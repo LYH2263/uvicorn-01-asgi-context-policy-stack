@@ -5,7 +5,6 @@ import contextvars
 import http
 import logging
 import re
-import sys
 import urllib
 from asyncio.events import TimerHandle
 from collections import deque
@@ -22,6 +21,7 @@ from uvicorn._types import (
     HTTPScope,
 )
 from uvicorn.config import Config
+from uvicorn.context import LoggingBinding, create_asgi_task, current_logging_binding, effective_policy
 from uvicorn.logging import TRACE_LOG_LEVEL
 from uvicorn.protocols.http.flow_control import HIGH_WATER_LIMIT, FlowControl, service_unavailable
 from uvicorn.protocols.utils import get_client_addr, get_local_addr, get_path_with_query_string, get_remote_addr, is_ssl
@@ -275,6 +275,7 @@ class HttpToolsProtocol(asyncio.Protocol):
             app = self.app
 
         existing_cycle = self.cycle
+        policy = effective_policy(self.config)
         self.cycle = RequestResponseCycle(
             scope=self.scope,
             transport=self.transport,
@@ -287,6 +288,8 @@ class HttpToolsProtocol(asyncio.Protocol):
             expect_100_continue=self.expect_100_continue,
             keep_alive=http_version != "1.0" and self.parser.should_keep_alive(),
             on_response=self.on_response_complete,
+            protocol_context=contextvars.copy_context(),
+            creator_logging_binding=policy.logging_binding,
         )
         if existing_cycle is None or existing_cycle.response_complete:
             # Standard case - start processing the request.
@@ -297,16 +300,11 @@ class HttpToolsProtocol(asyncio.Protocol):
             self.pipeline.appendleft((self.cycle, app))
 
     def _start_asgi_task(self, cycle: RequestResponseCycle, app: ASGI3Application) -> None:
-        if self.config.reset_contextvars:
-            # Opt-in workaround for https://github.com/python/cpython/issues/140947:
-            # asyncio can leak context vars between tasks. Hides context set in the
-            # lifespan or by external instrumentation.
-            if sys.version_info >= (3, 11):  # pragma: py-lt-311
-                task = self.loop.create_task(cycle.run_asgi(app), context=contextvars.Context())
-            else:  # pragma: py-gte-311
-                task = contextvars.Context().run(self.loop.create_task, cycle.run_asgi(app))
-        else:
-            task = self.loop.create_task(cycle.run_asgi(app))
+        # Read the merged view at task creation, not when the request headers
+        # were parsed: pipelined requests only start once the previous cycle
+        # completes and the current stack top must apply then.
+        task_context = effective_policy(self.config).task_context
+        task = create_asgi_task(self.loop, cycle.run_asgi(app), task_context)
         task.add_done_callback(self.tasks.discard)
         self.tasks.add(task)
 
@@ -390,6 +388,8 @@ class RequestResponseCycle:
         expect_100_continue: bool,
         keep_alive: bool,
         on_response: Callable[..., None],
+        protocol_context: contextvars.Context,
+        creator_logging_binding: LoggingBinding,
     ):
         self.scope = scope
         self.transport = transport
@@ -400,6 +400,10 @@ class RequestResponseCycle:
         self.default_headers = default_headers
         self.message_event = message_event
         self.on_response = on_response
+        # Snapshot of the context visible to the protocol layer when the
+        # request cycle starts, used when logging_binding is "protocol".
+        self.protocol_context = protocol_context
+        self.creator_logging_binding = creator_logging_binding
 
         # Connection state
         self.disconnected = False
@@ -415,6 +419,26 @@ class RequestResponseCycle:
         self.response_complete = False
         self.chunked_encoding: bool | None = None
         self.expected_content_length = 0
+
+    def _log_access(self, status_code: int) -> None:
+        """Emit the access record on the ASGI-task or protocol-layer context.
+
+        A frame pushed inside the ASGI task wins; otherwise the binding
+        captured at cycle creation applies.
+        """
+        binding = current_logging_binding() or self.creator_logging_binding
+        arguments = (
+            '%s - "%s %s HTTP/%s" %d',
+            get_client_addr(self.scope),
+            self.scope["method"],
+            get_path_with_query_string(self.scope),
+            self.scope["http_version"],
+            status_code,
+        )
+        if binding == "protocol":
+            self.protocol_context.run(self.access_logger.info, *arguments)
+        else:
+            self.access_logger.info(*arguments)
 
     # ASGI exception wrapper
     async def run_asgi(self, app: ASGI3Application) -> None:
@@ -479,14 +503,7 @@ class RequestResponseCycle:
             headers = self.default_headers + list(message.get("headers", []))
 
             if self.access_log:
-                self.access_logger.info(
-                    '%s - "%s %s HTTP/%s" %d',
-                    get_client_addr(self.scope),
-                    self.scope["method"],
-                    get_path_with_query_string(self.scope),
-                    self.scope["http_version"],
-                    status_code,
-                )
+                self._log_access(status_code)
 
             # Write response status line and headers
             content = [STATUS_LINE[status_code]]

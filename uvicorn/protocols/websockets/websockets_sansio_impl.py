@@ -26,6 +26,7 @@ from uvicorn._types import (
     WebSocketScope,
 )
 from uvicorn.config import Config
+from uvicorn.context import create_asgi_task, effective_policy
 from uvicorn.logging import TRACE_LOG_LEVEL
 from uvicorn.protocols.utils import (
     ClientDisconnected,
@@ -265,7 +266,11 @@ class WebSocketsSansIOProtocol(asyncio.Protocol):
             "extensions": {"websocket.http.response": {}},
         }
         self.queue.put_nowait({"type": "websocket.connect"})
-        task = self.loop.create_task(self.run_asgi())
+        # Read the merged view when the handshake completes, not when the
+        # protocol object is constructed (HTTP upgrades construct it first
+        # and replay the handshake bytes afterwards).
+        task_context = effective_policy(self.config).task_context
+        task = create_asgi_task(self.loop, self.run_asgi(), task_context)
         task.add_done_callback(self.on_task_complete)
         self.tasks.add(task)
 

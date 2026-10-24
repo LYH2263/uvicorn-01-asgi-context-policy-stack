@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import logging
-import sys
 from collections.abc import Callable
 from typing import Any, Literal
 from urllib.parse import unquote
@@ -20,6 +19,7 @@ from uvicorn._types import (
     HTTPScope,
 )
 from uvicorn.config import Config
+from uvicorn.context import LoggingBinding, create_asgi_task, current_logging_binding, effective_policy
 from uvicorn.logging import TRACE_LOG_LEVEL
 from uvicorn.protocols.http.flow_control import HIGH_WATER_LIMIT, FlowControl, service_unavailable
 from uvicorn.protocols.utils import get_client_addr, get_local_addr, get_path_with_query_string, get_remote_addr, is_ssl
@@ -184,6 +184,7 @@ class ZttpProtocol(asyncio.Protocol):
                 else:
                     app = self.app
 
+                policy = effective_policy(self.config)
                 self.cycle = RequestResponseCycle(
                     scope=self.scope,
                     conn=self.conn,
@@ -196,17 +197,13 @@ class ZttpProtocol(asyncio.Protocol):
                     message_event=asyncio.Event(),
                     expect_100_continue=event.expect_continue,
                     on_response=self.on_response_complete,
+                    protocol_context=contextvars.copy_context(),
+                    creator_logging_binding=policy.logging_binding,
                 )
                 if event.end_stream:
                     self.cycle.more_body = False
                     self.cycle.message_event.set()
-                if self.config.reset_contextvars:
-                    if sys.version_info >= (3, 11):  # pragma: py-lt-311
-                        task = self.loop.create_task(self.cycle.run_asgi(app), context=contextvars.Context())
-                    else:  # pragma: py-gte-311
-                        task = contextvars.Context().run(self.loop.create_task, self.cycle.run_asgi(app))
-                else:
-                    task = self.loop.create_task(self.cycle.run_asgi(app))
+                task = create_asgi_task(self.loop, self.cycle.run_asgi(app), policy.task_context)
                 task.add_done_callback(self.tasks.discard)
                 self.tasks.add(task)
 
@@ -331,6 +328,8 @@ class RequestResponseCycle:
         message_event: asyncio.Event,
         expect_100_continue: bool,
         on_response: Callable[..., None],
+        protocol_context: contextvars.Context,
+        creator_logging_binding: LoggingBinding,
     ) -> None:
         self.scope = scope
         self.conn = conn
@@ -342,6 +341,10 @@ class RequestResponseCycle:
         self.default_headers = default_headers
         self.message_event = message_event
         self.on_response = on_response
+        # Snapshot of the context visible to the protocol layer when the
+        # request cycle starts, used when logging_binding is "protocol".
+        self.protocol_context = protocol_context
+        self.creator_logging_binding = creator_logging_binding
 
         # Connection state
         self.disconnected = False
@@ -358,6 +361,26 @@ class RequestResponseCycle:
         self.bodyless = False
         self.chunked_encoding = False
         self.expected_content_length = 0
+
+    def _log_access(self, status: int) -> None:
+        """Emit the access record on the ASGI-task or protocol-layer context.
+
+        A frame pushed inside the ASGI task wins; otherwise the binding
+        captured at cycle creation applies.
+        """
+        binding = current_logging_binding() or self.creator_logging_binding
+        arguments = (
+            '%s - "%s %s HTTP/%s" %d',
+            get_client_addr(self.scope),
+            self.scope["method"],
+            get_path_with_query_string(self.scope),
+            self.scope["http_version"],
+            status,
+        )
+        if binding == "protocol":
+            self.protocol_context.run(self.access_logger.info, *arguments)
+        else:
+            self.access_logger.info(*arguments)
 
     # ASGI exception wrapper
     async def run_asgi(self, app: ASGI3Application) -> None:
@@ -461,14 +484,7 @@ class RequestResponseCycle:
                 headers = headers + [(b"transfer-encoding", b"chunked")]
 
             if self.access_log:
-                self.access_logger.info(
-                    '%s - "%s %s HTTP/%s" %d',
-                    get_client_addr(self.scope),
-                    self.scope["method"],
-                    get_path_with_query_string(self.scope),
-                    self.scope["http_version"],
-                    status,
-                )
+                self._log_access(status)
 
             # Write response status line and headers
             self.bodyless = bodyless

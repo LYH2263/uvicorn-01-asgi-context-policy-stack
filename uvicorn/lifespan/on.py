@@ -48,6 +48,12 @@ class LifespanOn:
         self.logger.info("Waiting for application startup.")
 
         loop = asyncio.get_event_loop()
+        # The lifespan runs in an independent sibling task and deliberately
+        # does not subscribe to the per-request/connection ASGI context policy
+        # stack (uvicorn.context): ContextVar writes made in the lifespan are
+        # not visible to application tasks by design, and a request/connection
+        # frame must never be shared with the lifespan. See docs about
+        # ``--reset-contextvars`` for the documented isolation.
         main_lifespan_task = loop.create_task(self.main())  # noqa: F841
         # Keep a hard reference to prevent garbage collection
         # See https://github.com/Kludex/uvicorn/pull/972
